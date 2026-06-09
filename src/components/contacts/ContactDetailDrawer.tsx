@@ -1,0 +1,662 @@
+import React, { useState, useEffect } from 'react';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { 
+  Phone, Mail, MessageSquare, MapPin, Building, Home, Tag, 
+  Edit, FileText, Download, Trash2, Coins
+} from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { useIsMobile } from '@/hooks/use-mobile';
+import { useAuth } from '@/contexts/AuthContext';
+import { supabase } from '@/integrations/supabase/client';
+import { uploadFile, deleteFile } from '@/services/storage';
+import { getContactFileUrl } from '@/services/contactFiles';
+import { deleteLead } from '@/services/leads';
+import ContactForm from './ContactForm';
+import ContactActivitiesTab from './ContactActivitiesTab';
+import ContactTasksEventsTab from './ContactTasksEventsTab';
+import ContactNotesComposer from './ContactNotesComposer';
+import ContactRecentNotes from './ContactRecentNotes';
+import ContactDealsSection from './ContactDealsSection';
+import { ContactPropertiesTab } from './ContactPropertiesTab';
+import { ContactDocumentsTab } from './ContactDocumentsTab';
+
+interface ContactDetailDrawerProps {
+  contact: any;
+  open: boolean;
+  onClose: () => void;
+  onUpdate?: () => void;
+}
+
+interface ContactFile {
+  id: string;
+  name: string;
+  path: string;
+  type: string;
+  created_at: string;
+}
+
+export default function ContactDetailDrawer({ 
+  contact, 
+  open, 
+  onClose, 
+  onUpdate 
+}: ContactDetailDrawerProps) {
+  const { toast } = useToast();
+  const { user, profile } = useAuth();
+  const isMobile = useIsMobile();
+  const [editMode, setEditMode] = useState(false);
+  const [files, setFiles] = useState<ContactFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [currentContact, setCurrentContact] = useState(contact);
+  const [ownershipTags, setOwnershipTags] = useState<string[]>([]);
+
+  const isAdmin = profile?.role === 'admin' || profile?.role === 'superadmin';
+  const canDelete = contact?._source === 'contacts'
+    ? isAdmin || contact?.created_by === user?.id
+    : isAdmin || contact?.agent_id === user?.id;
+
+  const handleContactUpdated = () => {
+    setEditMode(false);
+    onUpdate?.();
+    loadContactData();
+  };
+
+  const loadContactData = async () => {
+    if (!contact?.id) return;
+    await loadFiles();
+    await refreshContactData();
+    await loadOwnershipTags();
+  };
+
+  const refreshContactData = async () => {
+    if (!contact?.id) return;
+    try {
+      // Try leads first, then contacts
+      const { data: lead, error: leadError } = await supabase
+        .from('leads')
+        .select('*')
+        .eq('id', contact.id)
+        .maybeSingle();
+
+      if (lead) {
+        setCurrentContact({ ...contact, ...lead });
+        return;
+      }
+
+      const { data: realContact, error: contactError } = await supabase
+        .from('contacts')
+        .select('*')
+        .eq('id', contact.id)
+        .maybeSingle();
+
+      if (realContact) {
+        setCurrentContact({ ...contact, ...realContact });
+      } else if (leadError || contactError) {
+        console.error('Error refreshing contact:', leadError || contactError);
+      }
+    } catch (error) {
+      console.error('Error refreshing contact:', error);
+    }
+  };
+
+  useEffect(() => {
+    if (contact?.id && open) {
+      loadContactData();
+    }
+  }, [contact?.id, open]);
+
+  // Listen for contact updates
+  useEffect(() => {
+    const handleContactsUpdated = () => {
+      if (open && contact?.id) {
+        refreshContactData();
+      }
+    };
+
+    window.addEventListener('contacts:updated', handleContactsUpdated);
+    return () => window.removeEventListener('contacts:updated', handleContactsUpdated);
+  }, [open, contact?.id]);
+
+  // Realtime sync for ownership tags
+  useEffect(() => {
+    if (!open || !contact?.id) return;
+    const channel = supabase
+      .channel(`contact-ownership-${contact.id}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'contact_properties',
+        filter: `contact_id=eq.${contact.id}`
+      }, () => {
+        loadOwnershipTags();
+        refreshContactData();
+      })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'properties'
+      }, (payload) => {
+        const oldOwner = (payload as any)?.old?.owner_contact_id;
+        const newOwner = (payload as any)?.new?.owner_contact_id;
+        if (oldOwner === contact.id || newOwner === contact.id) {
+          loadOwnershipTags();
+          refreshContactData();
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [open, contact?.id]);
+
+  // Update local state when prop changes
+  useEffect(() => {
+    setCurrentContact(contact);
+  }, [contact]);
+
+  const loadFiles = async () => {
+    if (!contact?.id) return;
+    
+    try {
+      const { data, error } = await supabase
+        .from('contact_files')
+        .select('*')
+        .eq('contact_id', contact.id)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      setFiles(data || []);
+    } catch (error: any) {
+      console.error('Error loading files:', error);
+    }
+  };
+
+  const loadOwnershipTags = async () => {
+    if (!contact?.id) return;
+    try {
+      const { data, error } = await supabase
+        .from('contact_properties')
+        .select('property_id, properties(offer_type)')
+        .eq('contact_id', contact.id)
+        .eq('role', 'owner');
+
+      if (error) throw error;
+      const owned = (data || []).map((cp: any) => cp.properties).filter(Boolean);
+      const hasSale = owned.some((p: any) => p?.offer_type === 'sale');
+      const hasRent = owned.some((p: any) => p?.offer_type === 'rent');
+      const tags: string[] = [];
+      if (hasSale) tags.push('Seller');
+      if (hasRent) tags.push('Landlord');
+      setOwnershipTags(tags);
+    } catch (e) {
+      console.error('Error loading ownership tags:', e);
+    }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !contact?.id) return;
+
+    setUploading(true);
+    try {
+      const filePath = `contacts/${contact.id}/${Date.now()}_${file.name}`;
+      const { error: uploadError, path: storedPath } = await uploadFile('documents', filePath, file) as any;
+      
+      if (uploadError) throw uploadError;
+
+      const { error: dbError } = await supabase
+        .from('contact_files')
+        .insert({
+          contact_id: contact.id,
+          name: file.name,
+          path: storedPath || filePath,
+          type: file.type,
+          size: file.size,
+        });
+
+      if (dbError) throw dbError;
+
+      toast({ title: 'Success', description: 'File uploaded successfully' });
+      await loadFiles();
+    } catch (error: any) {
+      toast({
+        title: 'Upload failed',
+        description: error.message,
+        variant: 'destructive'
+      });
+    } finally {
+      setUploading(false);
+      event.target.value = '';
+    }
+  };
+
+  const handleFileDownload = async (file: ContactFile) => {
+    try {
+      const url = await getContactFileUrl(file.id);
+      window.open(url, '_blank');
+    } catch (error: any) {
+      const message = error.status === 403 
+        ? "You don't have access to this file"
+        : error.status === 404
+        ? "File not found. It may have been moved or deleted"
+        : error.message || "Could not download file";
+      
+      toast({
+        title: 'Download failed',
+        description: message,
+        variant: 'destructive'
+      });
+    }
+  };
+
+  const handleFileDelete = async (file: ContactFile) => {
+    if (!confirm('Delete this file?')) return;
+
+    try {
+      const { error: storageError } = await deleteFile('documents', file.path);
+      if (storageError) throw storageError;
+
+      const { error: dbError } = await supabase
+        .from('contact_files')
+        .delete()
+        .eq('id', file.id);
+
+      if (dbError) throw dbError;
+
+      toast({ title: 'Success', description: 'File deleted successfully' });
+      await loadContactData();
+    } catch (error: any) {
+      toast({
+        title: 'Delete failed',
+        description: error.message,
+        variant: 'destructive'
+      });
+    }
+  };
+
+  const getStatusVariant = (status: string) => {
+    switch (status?.toLowerCase()) {
+      case 'lead': return 'secondary';
+      case 'active_client': return 'default';
+      case 'past_client': return 'outline';
+      case 'new': return 'secondary';
+      case 'contacted': return 'default';
+      case 'qualified': return 'default';
+      case 'won': return 'default';
+      case 'lost': return 'destructive';
+      default: return 'outline';
+    }
+  };
+
+  const getInitials = (name: string) => {
+    return name
+      .split(' ')
+      .map(n => n.charAt(0))
+      .join('')
+      .toUpperCase()
+      .slice(0, 2);
+  };
+
+  const handleDeleteContact = async () => {
+    if (!contact || !canDelete) {
+      toast({
+        title: 'Permission denied',
+        description: 'You can only delete your own contacts',
+        variant: 'destructive'
+      });
+      return;
+    }
+
+    if (!confirm(`Delete contact "${contact.name}"? This action cannot be undone.`)) {
+      return;
+    }
+
+    setDeleting(true);
+    try {
+      // Determine which table to delete from
+      let error;
+      if (contact._source === 'contacts') {
+        const { error: deleteError } = await supabase
+          .from('contacts')
+          .delete()
+          .eq('id', contact.id);
+        error = deleteError;
+      } else {
+        const { error: deleteError } = await deleteLead(contact.id);
+        error = deleteError;
+      }
+
+      if (error) {
+        toast({
+          title: 'Error deleting contact',
+          description: error.message,
+          variant: 'destructive'
+        });
+        return;
+      }
+
+      // Dispatch events for sync
+      window.dispatchEvent(new CustomEvent('contacts:updated'));
+      window.dispatchEvent(new CustomEvent('leads:changed'));
+
+      toast({
+        title: 'Contact deleted',
+        description: `${contact.name} has been removed`
+      });
+
+      // Close drawer
+      onClose();
+    } catch (error: any) {
+      toast({
+        title: 'Error deleting contact',
+        description: error.message,
+        variant: 'destructive'
+      });
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  if (!contact) return null;
+
+  return (
+    <Sheet open={open} onOpenChange={onClose}>
+      <SheetContent 
+        className={`${isMobile ? 'w-full' : 'w-full sm:max-w-3xl'} p-0 flex flex-col h-full`}
+        side="right"
+      >
+        {/* Header */}
+        <SheetHeader className="p-4 sm:p-6 border-b bg-muted/30 flex-shrink-0">
+          <div className="flex items-start justify-between">
+            <div className="flex items-center gap-3">
+              <Avatar className="h-12 w-12">
+                <AvatarFallback className="bg-primary text-primary-foreground text-sm font-medium">
+                  {getInitials(contact.name || 'Contact')}
+                </AvatarFallback>
+              </Avatar>
+              <div>
+                <SheetTitle className="text-lg font-semibold">
+                  {currentContact?.name || 'Unknown Contact'}
+                </SheetTitle>
+                <div className="flex items-center gap-2 mt-1">
+                  <Badge variant={getStatusVariant(currentContact?.contact_status || currentContact?.status)}>
+                    {currentContact?.contact_status || currentContact?.status}
+                  </Badge>
+                  {/* Ownership role tags (Owner / Landlord) */}
+                  {ownershipTags.map((tag) => (
+                    <Badge key={tag} variant="default" className="text-xs">
+                      {tag}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {!editMode && (
+                <>
+                  <Button variant="outline" size="sm" onClick={() => setEditMode(true)}>
+                    <Edit className="h-4 w-4 mr-1 sm:mr-2" />
+                    {isMobile ? '' : 'Edit'}
+                  </Button>
+                  {canDelete && (
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      onClick={handleDeleteContact}
+                      disabled={deleting}
+                      className="text-destructive hover:text-destructive"
+                    >
+                      <Trash2 className="h-4 w-4 mr-1 sm:mr-2" />
+                      {isMobile ? '' : deleting ? 'Deleting...' : 'Delete'}
+                    </Button>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Quick Actions Bar - Always visible */}
+          <div className="flex flex-wrap gap-2 mt-4 pt-4 border-t">
+            {currentContact?.phone && (
+              <Button size="sm" variant="outline" onClick={() => window.open(`tel:${currentContact.phone}`, '_self')}>
+                <Phone className="h-3 w-3 mr-1" />
+                Call
+              </Button>
+            )}
+            {currentContact?.email && (
+              <Button size="sm" variant="outline" onClick={() => window.open(`mailto:${currentContact.email}`, '_blank')}>
+                <Mail className="h-3 w-3 mr-1" />
+                Email
+              </Button>
+            )}
+            {currentContact?.phone && (
+              <Button 
+                size="sm" 
+                variant="outline" 
+                onClick={() => window.open(`https://wa.me/${currentContact.phone?.replace(/[^\d]/g, '')}`, '_blank')}
+              >
+                <MessageSquare className="h-3 w-3 mr-1" />
+                {isMobile ? 'WhatsApp' : 'WhatsApp'}
+              </Button>
+            )}
+            
+            <label className="cursor-pointer">
+              <input
+                type="file"
+                className="hidden"
+                onChange={handleFileUpload}
+                disabled={uploading}
+              />
+              <Button size="sm" variant="outline" disabled={uploading} asChild>
+                <span>
+                  <FileText className="h-3 w-3 mr-1" />
+                  {uploading ? 'Uploading...' : 'Upload'}
+                </span>
+              </Button>
+            </label>
+          </div>
+        </SheetHeader>
+
+        {/* Scrollable Content */}
+        <div className="flex-1 overflow-hidden">
+          <ScrollArea className="h-full">
+            <div className="p-4 sm:p-6">
+              <Tabs defaultValue="overview" className="space-y-6">
+                <TabsList className="grid w-full grid-cols-6">
+                  <TabsTrigger value="overview">Overview</TabsTrigger>
+                  <TabsTrigger value="activities">Activities</TabsTrigger>
+                  <TabsTrigger value="tasks-events">Tasks & Events</TabsTrigger>
+                  <TabsTrigger value="deals">Deals</TabsTrigger>
+                  <TabsTrigger value="properties">Properties</TabsTrigger>
+                  <TabsTrigger value="documents">Documents</TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="overview" className="space-y-4">
+                  {editMode ? (
+                    <ContactForm
+                      contact={contact}
+                      onSuccess={handleContactUpdated}
+                      onCancel={() => setEditMode(false)}
+                    />
+                  ) : (
+                    <div className="space-y-4">
+
+                      {/* Contact Information Card */}
+                      <Card>
+                        <CardHeader>
+                          <CardTitle className="text-sm">Contact Information</CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-3">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Email</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Mail className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm">{currentContact?.email || 'No email'}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Phone</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Phone className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm">{currentContact?.phone || 'No phone'}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Address</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <MapPin className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm">{currentContact?.address || 'No address'}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Source</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Tag className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm capitalize">{currentContact?.source || 'Unknown'}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+
+                      {/* Enquiry Information Card */}
+                      <Card>
+                        <CardHeader>
+                          <CardTitle className="text-sm">Enquiry Details</CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-3">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Interest Type</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Building className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm capitalize">{currentContact?.category || 'Not specified'}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Budget</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Coins className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm">
+                                  {currentContact?.budget_min && currentContact.budget_max 
+                                    ? `AED ${currentContact.budget_min?.toLocaleString()} - ${currentContact.budget_max?.toLocaleString()}`
+                                    : 'Not specified'
+                                  }
+                                </span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Location</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <MapPin className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm">{currentContact?.location_address || 'Not specified'}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Property Type</Label>
+                              <div className="flex items-center gap-2 mt-1">
+                                <Home className="w-4 h-4 text-muted-foreground" />
+                                <span className="text-sm capitalize">{currentContact?.subtype || 'Not specified'}</span>
+                              </div>
+                            </div>
+                          </div>
+                          {ownershipTags.length > 0 && (
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Client Role</Label>
+                              <div className="flex flex-wrap gap-1 mt-1">
+                                {ownershipTags.map((tag) => (
+                                  <Badge key={tag} variant="default" className="text-xs">
+                                    {tag}
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {currentContact?.notes && (
+                            <div>
+                              <Label className="text-xs font-medium text-muted-foreground">Notes</Label>
+                              <p className="text-sm mt-1">{currentContact.notes}</p>
+                            </div>
+                          )}
+                        </CardContent>
+                      </Card>
+
+                      {/* Files */}
+                      {files.length > 0 && (
+                        <Card>
+                          <CardHeader>
+                            <CardTitle className="text-sm">Documents</CardTitle>
+                          </CardHeader>
+                          <CardContent className="space-y-2">
+                            {files.map((file) => (
+                              <div key={file.id} className="flex items-center justify-between p-2 border rounded">
+                                <div className="flex items-center gap-2">
+                                  <FileText className="w-4 h-4 text-muted-foreground" />
+                                  <span className="text-sm">{file.name}</span>
+                                </div>
+                                <div className="flex gap-1">
+                                  <Button size="sm" variant="ghost" onClick={() => handleFileDownload(file)}>
+                                    <Download className="w-4 h-4" />
+                                  </Button>
+                                  <Button size="sm" variant="ghost" onClick={() => handleFileDelete(file)}>
+                                    <Trash2 className="w-4 h-4" />
+                                  </Button>
+                                </div>
+                              </div>
+                            ))}
+                          </CardContent>
+                        </Card>
+                      )}
+
+                      {/* Recent Notes - above notes composer */}
+                      <ContactRecentNotes contactId={contact.id} />
+
+                      {/* Notes Composer - at the very end */}
+                      <div id="notes-composer">
+                        <ContactNotesComposer 
+                          contactId={contact.id} 
+                          onNoteAdded={handleContactUpdated}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </TabsContent>
+
+                <TabsContent value="activities" className="space-y-4">
+                  <ContactActivitiesTab contactId={contact.id} />
+                </TabsContent>
+
+                <TabsContent value="tasks-events" className="space-y-4">
+                  <ContactTasksEventsTab contactId={contact.id} />
+                </TabsContent>
+
+                <TabsContent value="deals" className="space-y-4">
+                  <ContactDealsSection contactId={contact.id} />
+                </TabsContent>
+
+                <TabsContent value="properties" className="space-y-4">
+                  <ContactPropertiesTab contactId={contact.id} />
+                </TabsContent>
+
+                <TabsContent value="documents" className="space-y-4">
+                  <ContactDocumentsTab contactId={contact.id} />
+                </TabsContent>
+              </Tabs>
+            </div>
+          </ScrollArea>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

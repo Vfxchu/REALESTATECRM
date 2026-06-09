@@ -1,0 +1,1 @@
+-- Duplicate migration made empty to prevent errors

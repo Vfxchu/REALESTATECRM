@@ -1,0 +1,264 @@
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import { User, Session } from '@supabase/supabase-js';
+import { supabase } from '@/integrations/supabase/client';
+import { getCurrentUserRole, type UserRole } from '@/services/user-roles';
+import { formatErrorForUser } from '@/lib/error-handler';
+
+// Re-export UserRole for backward compatibility
+export type { UserRole };
+
+export interface UserProfile {
+  id: string;
+  user_id: string;
+  email: string;
+  name: string;
+  role: UserRole;
+  avatar_url?: string;
+  phone?: string;
+  status?: 'active' | 'inactive';
+  created_at: string;
+  updated_at: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  profile: UserProfile | null;
+  login: (email: string, password: string) => Promise<{ error: any }>;
+  signup: (email: string, password: string, name: string, role?: UserRole) => Promise<{ error: any }>;
+  logout: () => Promise<void>;
+  isLoading: boolean;
+  isAuthenticated: boolean;
+  session: Session | null;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+
+interface AuthProviderProps {
+  children: React.ReactNode;
+}
+
+export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    console.log('[AUTH] Setting up auth state listener');
+    
+    // Set up auth state listener
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        console.log('[AUTH] Auth state changed:', event, session?.user?.email || 'No user');
+        setSession(session);
+        setUser(session?.user ?? null);
+        
+        if (session?.user) {
+          // Use setTimeout to prevent authentication deadlock
+          setTimeout(async () => {
+            try {
+              // Fetch profile and role securely
+              const [profileResult, userRole] = await Promise.all([
+                supabase
+                  .from('profiles')
+                  .select('*')
+                  .eq('user_id', session.user.id)
+                  .single(),
+                getCurrentUserRole()
+              ]);
+
+              if (profileResult.error) {
+                console.error('Error fetching profile:', profileResult.error);
+                // Create a fallback profile if none exists
+                const fallbackProfile: UserProfile = {
+                  id: session.user.id,
+                  user_id: session.user.id,
+                  email: session.user.email || '',
+                  name: session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'User',
+                  role: userRole,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString()
+                };
+                setProfile(fallbackProfile);
+              } else {
+                // Use secure role from user_roles table
+                setProfile({
+                  ...profileResult.data,
+                  role: userRole
+                } as UserProfile);
+              }
+            } catch (error) {
+              console.error('Error during profile fetch:', formatErrorForUser(error, 'profile fetch'));
+              setProfile(null);
+            } finally {
+              setIsLoading(false);
+            }
+          }, 0);
+        } else {
+          setProfile(null);
+          setIsLoading(false);
+        }
+      }
+    );
+
+    // Check for existing session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      console.log('[AUTH] Initial session check:', session?.user?.email || 'No session');
+      setSession(session);
+      setUser(session?.user ?? null);
+      
+      if (session?.user) {
+        // Fetch user profile with error handling
+        Promise.all([
+          supabase
+            .from('profiles')
+            .select('*')
+            .eq('user_id', session.user.id)
+            .single(),
+          getCurrentUserRole()
+        ]).then(([profileResult, userRole]) => {
+          if (profileResult.error) {
+            console.error('Error fetching profile:', profileResult.error);
+            // Create a fallback profile if none exists
+            const fallbackProfile: UserProfile = {
+              id: session.user.id,
+              user_id: session.user.id,
+              email: session.user.email || '',
+              name: session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'User',
+              role: userRole,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            };
+            setProfile(fallbackProfile);
+          } else {
+            // Use secure role from user_roles table
+            setProfile({
+              ...profileResult.data,
+              role: userRole
+            } as UserProfile);
+          }
+          setIsLoading(false);
+        }).catch(error => {
+          console.error('Error during initial profile fetch:', formatErrorForUser(error, 'initial profile fetch'));
+          setProfile(null);
+          setIsLoading(false);
+        });
+      } else {
+        setIsLoading(false);
+      }
+    });
+
+    // Proactive token refresh - check every 5 minutes
+    const refreshInterval = setInterval(async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (session) {
+        const expiresAt = session.expires_at;
+        if (expiresAt) {
+          const timeUntilExpiry = (expiresAt * 1000) - Date.now();
+          // Refresh token if it expires in less than 10 minutes
+          if (timeUntilExpiry < 10 * 60 * 1000) {
+            console.log('[AUTH] Proactively refreshing session token');
+            await supabase.auth.refreshSession();
+          }
+        }
+      }
+    }, 5 * 60 * 1000); // Check every 5 minutes
+
+    return () => {
+      subscription.unsubscribe();
+      clearInterval(refreshInterval);
+    };
+  }, []);
+
+  const login = async (email: string, password: string) => {
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) {
+        // Handle specific error cases with user-friendly messages
+        if (error.message.includes('Email not confirmed')) {
+          return { error: { message: 'Please verify your email before signing in. Check your inbox for the confirmation link.', code: 'email_not_confirmed' } };
+        }
+        if (error.message.includes('Invalid login credentials')) {
+          return { error: { message: 'Invalid email or password. Please check your credentials and try again.' } };
+        }
+        if (error.message === '{}') {
+          return { error: { message: 'Login failed. Please try again or contact support.' } };
+        }
+        return { error: { message: formatErrorForUser(error, 'login') } };
+      }
+      return { error: null };
+    } catch (e: any) {
+      console.error('[AUTH] Login network error:', e);
+      if (e?.status === 503) {
+        return { error: { message: 'Service temporarily unavailable. Please try again in a moment.' } };
+      }
+      return { error: { message: 'Network connection failed. Please check your internet connection.' } };
+    }
+  };
+
+  const signup = async (email: string, password: string, name: string, role: UserRole = 'agent') => {
+    try {
+      const redirectUrl = `${window.location.origin}/`;
+      
+      const { error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          emailRedirectTo: redirectUrl,
+          data: {
+            name,
+            role,
+          }
+        }
+      });
+      
+      if (error) {
+        // Better error handling
+        if (error.message.includes('User already registered')) {
+          return { error: { message: 'An account with this email already exists. Try signing in instead.' } };
+        }
+        if (error.message === '{}') {
+          return { error: { message: 'Signup failed. Please try again or contact support.' } };
+        }
+        return { error: { message: formatErrorForUser(error, 'signup') } };
+      }
+      return { error: null };
+    } catch (e: any) {
+      console.error('[AUTH] Signup network error:', e);
+      if (e?.status === 503) {
+        return { error: { message: 'Service temporarily unavailable. Please try again in a moment.' } };
+      }
+      return { error: { message: 'Network connection failed. Please check your internet connection.' } };
+    }
+  };
+
+  const logout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  const isAuthenticated = !!user;
+
+  return (
+    <AuthContext.Provider value={{ 
+      user, 
+      profile,
+      session,
+      login, 
+      signup,
+      logout, 
+      isLoading, 
+      isAuthenticated 
+    }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
